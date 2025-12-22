@@ -7,18 +7,17 @@ Empirical analysis of broadband penetration and GDP per capita growth across cou
 
 ## Table of Contents
 
-1. Project Overview
-2. Research Question
-3. Data Sources
-4. Data Preparation
-5. Modeling Framework
-6. Model Diagnostics and Validation
-7. Results
-8. Limitations
-9. Repository Structure
-10. How to Reproduce
-11. Citations
-
+* [Project Overview](#project-overview)
+* [Research Question](#research-question)
+* [Data Sources](#data-sources)
+* [Data Preparation](#data-preparation)
+* [Modeling Framework](#modeling-framework)
+* [Model Diagnostics and Validation](#model-diagnostics-and-validation)
+* [Results](#results)
+* [Limitations](#limitations)
+* [Repository Structure](#repository-structure)
+* [How to Reproduce](#how-to-reproduce)
+* [Citations](#citations)
 ---
 
 ## Project Overview
@@ -240,7 +239,7 @@ The script:
 
 ---
 
-## Citations (APA 7th Edition)
+## Citations
 
 1. Czernich, N., Falck, O., Kretschmer, T., & Woessmann, L. (2011). Broadband infrastructure and economic growth. *The Economic Journal, 121*(552), 505–532. [https://www.jstor.org/stable/41236989](https://www.jstor.org/stable/41236989)
 
