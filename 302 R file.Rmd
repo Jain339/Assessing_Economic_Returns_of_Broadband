@@ -1,0 +1,1060 @@
+---
+title: "Linear Model"
+author: "Nikita Jain, Theo Ambarita, Jake Cohen"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    highlight: tango
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(warning = FALSE)
+knitr::opts_chunk$set(message = FALSE)
+```
+
+# 0. Set-up
+
+## 0.1. Load required packages
+
+```{r}
+library(car)
+library(leaps)
+library(tidyverse)
+```
+
+## 0.2. Load raw data files
+
+```{r}
+metadata <- read_csv("./metadata.csv")
+broadband <- read_csv("./Broadband.csv")
+```
+
+# 1. Join files
+
+Merge relevant metadata with the main data table, and remove extraneous entries.
+
+```{r}
+# Remove entries that are metadata
+broadband <- broadband[1:2688, ]
+
+# Add region names as covariates
+broadband <- broadband %>%
+  left_join(
+    metadata %>%
+      select("Country Code" = Code, Region),
+    by = "Country Code"
+  )
+
+# Remove entries corresponding to regional summaries
+broadband <- broadband %>%
+  filter(!(`Country Name` %in% c(unique(metadata$Region), 
+         "Middle East, North Africa, Afghanistan & Pakistan")))
+```
+
+If we examine the head of our data frame...
+
+```{r}
+head(broadband)
+```
+
+...it's evident the table isn't structured the way we want it to be. We want the series names to be column headers with corresponding values below. We'll also have columns to keep track of the year each observation was made, and the country/region it corresponds with.
+
+```{r}
+# First, rename the columns to just have the year (i.e. no [YR20XX])
+colnames(broadband)[5:25] <- as.character(1995:2015)
+
+# Next, get the names of each series; these names will be the new columns
+series.names <- unique(broadband$`Series Name`)
+series.names <- series.names[!is.na(series.names)]
+
+# Country names
+country.names <- unique(broadband$`Country Name`)
+
+# Build the final data frame
+df <- data.frame(
+  matrix(nrow = 1, ncol = 3 + length(series.names))
+)
+colnames(df) <- c("Country Name", "Year", "Region", series.names)
+
+for (i in 1:length(country.names)) {
+  for (year in 1995:2015) {
+    name <- country.names[i]
+    code <- broadband[broadband$`Country Name` == name, "Country Code"][1, ] %>%
+      as.character()
+    region <- metadata[metadata$Code == code, "Region"] %>%
+      as.character()
+    
+    # Create the row for the country/year pair
+    row <- c(name, year, region)
+    
+    # Extract the relevant values
+    vals <- broadband %>%
+      filter(`Country Name` == name) %>%
+      select(as.character(year)) %>%
+      unlist() %>%
+      as.character()
+    
+    row <- c(row, vals)
+    df <- rbind(df, row)
+  }
+}
+
+# Drop the empty row at the top
+df <- df[2:nrow(df), ]
+```
+
+# 2. Clean the data
+
+Right now, missing values are denoted by `...`, which also causes columns that should be numeric to be treated as strings. If we replace all `...` values with `NA`, we can convert these variables into the correct data type.
+
+```{r}
+for (series.name in series.names) {
+  # Pull out the column
+  col <- df[series.name] %>%
+    unlist() %>%
+    as.character()
+  
+  # Swap '..' for NA
+  col <- replace(col, col == "..", NA)
+  
+  # Override the column in the data frame
+  df[series.name] <- as.numeric(col)
+}
+
+str(df)
+```
+
+Perfect! Now, we have to remove rows with missing values for our response variable, GDP per capita growth. We'll also remove any countries with no values for a predictor from the data table, since we can't very well impute values without a reference point for that country.
+
+```{r}
+# Remove rows without a value for the response variable, GDP per capita growth
+df <- df %>%
+  filter(!is.na(`GDP per capita growth (annual %)`))
+
+# Remove countries with all missing values for any predictor
+na.countries <- c()
+for (country in unique(df$`Country Name`)) {
+  # Pull all rows with that country
+  all.na <- df %>%
+    filter(`Country Name` == country) %>%
+    summarize(
+      across(
+        .cols = -c(`Country Name`, Year, `GDP per capita growth (annual %)`),
+        .fns = ~ all(is.na(.))
+      )
+    )
+  
+  # If so, add the country's name to the na.countries vector
+  if (any(all.na)) {
+    na.countries <- c(na.countries, country)
+  }
+}
+
+df <- df %>%
+  filter(!(`Country Name` %in% na.countries))
+```
+
+# 3. Impute missing predictor values
+
+For each country, we'll go through every predictor and use the median value of each predictor to replace missing values. In breaking it up by country, we decrease how homogenous our data is and, in theory, capture more real-world variation.
+
+```{r}
+for (country in df$`Country Name`) {
+  # Pull all rows with that country
+  country.rows <- df %>%
+    filter(`Country Name` == country)
+  
+  # For each PREDICTOR column, extract the median values
+  column.medians <- country.rows %>%
+    select(-`Country Name`, -Region, -Year, -`GDP per capita growth (annual %)`) %>% # only want predictors
+    apply(2, median, na.rm = TRUE)
+  
+  for (name in names(column.medians)) {
+    rows.to.impute <- which(df$`Country Name` == country & is.na(df[[name]]))
+    df[rows.to.impute, name] <- column.medians[name]
+  }
+}
+```
+
+**ASIDE:** Before moving on, we're going to rename the columns for simplicity's sake. We'll also export the data table to a `.csv` file for later access.
+
+```{r}
+colnames(df) <- c("country", "year", "region",  "gdp_growth", "broadband", "mobile", "internet_use", "gross_capital", "trade_gdp", "school_enroll", "pop_growth", "urban_pop", "rule_of_law", "fdi", "inflation")
+
+write_csv(df, "./broadband_final.csv")
+```
+
+# 4. Split the data
+
+Before doing any exploratory data analysis, transformations, or model fitting, we have to split our data into a training set and a testing set.
+
+```{r}
+# Seed for reproducibility
+set.seed(123)
+
+# Generate train/test indices for 80/20 split
+train.indices <- sample(1:nrow(df), 0.8 * nrow(df), replace = FALSE)
+df.train <- df[train.indices, ]
+df.test <- df[-train.indices, ]
+```
+
+# 5. Exploratory data analysis (EDA)
+
+## 5.1. Training data
+
+First, we'll examine the response variable.
+
+```{r}
+# Numerically
+summary(df.train$gdp_growth)
+
+# Graphically
+par(mfrow = c(1, 3))
+plot(df.train$gdp_growth)
+hist(df.train$gdp_growth)
+boxplot(df.train$gdp_growth)
+```
+
+Seems like we may have issues with regards to some right skew. Something to look into again later when we address any violated model assumptions. The scatter plot makes the data seem pretty continuous, especially around 0. The box plot shows that there are quite a few outliers in the data.
+
+Now, we have to think about whether or not we can consider the observations independent of one another. Although the GDP of one country may have some influence on that of another, especially when considering how globalized the world is, it would be fair to assume that it's *independent enough* for the sake of this project. GDP growth within a single country from one year to the next will likely be fairly similar. However, we will assume the correlation between subsequent values in the time series is negligible.
+
+Next, we'll investigate the response variables both numerically and graphically.
+
+```{r, fig.width=16}
+# Get column names of predictors
+predictors <- df.train %>%
+  select(-country, -year, -gdp_growth) %>%
+  colnames()
+
+# Summarize numerically (ignore region)
+summaries <- lapply(df.train[, predictors], summary)
+summaries
+
+# Summarize graphically
+par(mfrow = c(3, 4), cex.lab = 1.5)
+plot(df.train$broadband %>%
+          unlist(), ylab = "Broadband Subscriptions")
+plot(df.train$mobile  %>%
+          unlist(), ylab = "Mobile Subscriptions")
+plot(df.train$internet_use %>%
+          unlist(), ylab = "Internet Usage")
+plot(df.train$gross_capital %>%
+          unlist(), ylab = "Gross Capital")
+plot(df.train$trade_gdp %>%
+          unlist(), ylab = "Trade (%)")
+plot(df.train$school_enroll %>%
+          unlist(), ylab = "School Enrollment (%)")
+plot(df.train$pop_growth %>%
+          unlist(), ylab = "Population Growth")
+plot(df.train$urban_pop %>%
+          unlist(), ylab = "Urban Population")
+plot(df.train$rule_of_law %>%
+          unlist(), ylab = "Rule of Law")
+plot(df.train$fdi %>%
+          unlist(), ylab = "Foreign Direct Investment")
+plot(df.train$inflation %>%
+          unlist(), ylab = "Inflation")
+```
+
+In terms of continuity, the scatter plots don't raise any concerns. However, considering the goal of our study is to investigate the effects of region and broadband on GDP growth, `Urban Population %` could be expected to be somewhat significant. However, in it's current form, it is continuous, which may make it difficult to tease apart rural, suburban, urban, metropolitan, etc. areas. It might be plausible to categorize `Urban Population %` into categories, e.g. rural, urban, suburban.
+
+We will define urban population % less than 40 as low, a % less than 80 as medium, and a percent greater than or equal to 80 as high.
+
+```{r}
+df.train <- df.train %>%
+  mutate(
+    urban_pop = sapply(
+      urban_pop,
+      function(percentage) {
+        if (percentage < 40) "low"
+        else if (percentage < 80) "medium"
+        else "high"
+    })
+  )
+```
+
+## 5.2. Testing data
+
+We'll repeat the same process for the testing data.
+
+First, the response variable.
+
+```{r}
+# Numerically
+summary(df.test$gdp_growth)
+
+# Graphically
+par(mfrow = c(1, 3))
+plot(df.test$gdp_growth)
+hist(df.test$gdp_growth)
+boxplot(df.test$gdp_growth)
+```
+
+We see similar patterns of some right skew, which is good!
+
+Now, we'll investigate the predictors.
+
+```{r, fig.width=16}
+# Summarize numerically (ignore region)
+summaries <- lapply(df.test[, predictors], summary)
+summaries
+
+# Summarize graphically
+par(mfrow = c(3, 4), cex.lab = 1.5)
+plot(df.test$broadband %>%
+          unlist(), ylab = "Broadband Subscriptions")
+plot(df.test$mobile  %>%
+          unlist(), ylab = "Mobile Subscriptions")
+plot(df.test$internet_use %>%
+          unlist(), ylab = "Internet Usage")
+plot(df.test$gross_capital %>%
+          unlist(), ylab = "Gross Capital")
+plot(df.test$trade_gdp %>%
+          unlist(), ylab = "Trade (%)")
+plot(df.test$school_enroll %>%
+          unlist(), ylab = "School Enrollment (%)")
+plot(df.test$pop_growth %>%
+          unlist(), ylab = "Population Growth")
+plot(df.test$urban_pop %>%
+          unlist(), ylab = "Urban Population")
+plot(df.test$rule_of_law %>%
+          unlist(), ylab = "Rule of Law")
+plot(df.test$fdi %>%
+          unlist(), ylab = "Foreign Direct Investment")
+plot(df.test$inflation %>%
+          unlist(), ylab = "Inflation")
+```
+
+The distribution of our data doesn't look particularly different! We also have to apply the same transformation to `Urban Population %`.
+
+```{r}
+df.test <- df.test %>%
+  mutate(
+    urban_pop = sapply(
+      urban_pop,
+      function(percentage) {
+        if (percentage < 40) "low"
+        else if (percentage < 80) "medium"
+        else "high"
+    })
+  )
+```
+
+## 5.3. Comparison
+
+We have to make sure that the training data and testing data come from the same distribution. Otherwise, comparing the model fit to the training data and the one fit to the testing data won't provide accurate information for model validation. We're primarily concerned with the response variable, so we'll perform a t-test on the response variable in each of the training and testing data sets. Before doing this, however, we must ensure...
+
+1.  The data are normal
+2.  The data have the same or similar variances
+
+```{r}
+# 1. Assess normality
+par(mfrow = c(1, 2))
+qqnorm(df.train$gdp_growth, main = "Normal Q-Q Plot - Train")
+qqline(df.train$gdp_growth)
+qqnorm(df.test$gdp_growth, main = "Normal Q-Q Plot - Test")
+qqline(df.test$gdp_growth)
+
+# 2. Check variance
+sprintf("The variance of the training dataset's response is %.4f", var(df.train$gdp_growth))
+sprintf("The variance of the testing dataset's response is %.4f", var(df.test$gdp_growth))
+```
+
+The variances are similar! However, both the training and testing data sets seem to violate the normality assumption due to their heavy tails. However, since the sample size for the training and testing data are both large (2672 and 669 respectively) we're going to proceed regardless. For this test, we're going to have our assumptions as follows:
+
+-   $H_0:\mu_{train} = \mu_{test}$
+-   $H_A:\mu_{train} \ne \mu_{test}$
+
+```{r}
+t.test(df.train$gdp_growth, df.test$gdp_growth, alternative = "two.sided")
+```
+
+Excellent! We got a p-value of 0.6, which means we **cannot** reject the null hypothesis that the means of each of the response variables are equal This justifies our assumption that the training and testing data are derived from the same distribution, meaning they *should* both represent the same amount of variance in the population.
+
+# 6. Fit initial model
+
+Now that we've successfully cleaned our data and split it into a training and testing set, we can fit an initial model to our training data.
+
+```{r}
+model_prelim <- lm(gdp_growth ~ broadband * region + mobile + internet_use + gross_capital + trade_gdp + school_enroll + pop_growth + urban_pop + inflation + fdi + rule_of_law, df.train)
+
+summary(model_prelim)
+```
+
+# 7. Check assumptions
+
+Before examining our residual plots, we have to check the two additional assumptions for multiple linear regression.
+
+```{r}
+fits <- fitted(model_prelim)
+r <- residuals(model_prelim)
+
+# 1. Conditional mean response condition
+plot(fits, df.train$gdp_growth)
+abline(a = 0, b = 1, col = "red")
+```
+
+The relationship between the fitted and actual values seems linear! We can now check the second assumption.
+
+```{r}
+pairs(df.train %>%
+        select(-country, -year, -region, -urban_pop))
+```
+
+Based on the pairs plot, the predictors seem to either have no relationship or a linear relationship with one another. Thus, the second additional assumption of multiple linear regression is satisfied, and we can move on to checking residual plots to assess the primary four assumptions of linear regression.
+
+```{r}
+par(mfrow = c(1, 2))
+qqnorm(r)
+qqline(r)
+plot(fits, r)
+```
+
+The normal Q-Q plot shows severe deviations from normality, due to heavy tails. The residual vs. fitted plot, however, seems to satisfy the linearity of expectation assumption. The uncorrelated errors assumption also seems alright, since there aren't separate clusters of points. The constant variance assumption is a bit tricky to assess. There seems to be a significant number of outliers and high-leverage points, which may be the reason we see the pattern we do. However, it seems to be satisfied for the most part.
+
+```{r, fig.height=16, fig.width=8}
+par(mfrow = c(5, 2))
+plot(df.train$broadband, r)
+plot(df.train$mobile, r)
+plot(df.train$internet_use, r)
+plot(df.train$gross_capital, r)
+plot(df.train$trade_gdp, r)
+plot(df.train$school_enroll, r)
+plot(df.train$pop_growth, r)
+plot(df.train$rule_of_law, r)
+plot(df.train$fdi, r)
+plot(df.train$inflation, r)
+```
+
+Again, we don't see any non-linear relationships. There are a lot of what appear to be influential points. Additionally, broadband, internet usage, mobile, FDI, and inflation all seem like they may have non-constant variance. FDI, inflation, gross capital, broadband, mobile, and internet usage also have some bands, indicating some potential correlation in errors. However, this mostly occurs near 0, which isn't too concerning. Also, even if there was significant correlation between errors, there isn't any transformation we could apply to address it.
+
+```{r}
+vif(model_prelim)
+```
+
+Awesome! Also no issues with multicollinearity. We will now proceed with transformations to attempt to correct assumption violations.
+
+```{r}
+# Transform GDP growth per capita to be greater than 0
+gdp_gt0 <- df.train$gdp_growth + abs(min(df.train$gdp_growth)) + 1
+powerTransform(gdp_gt0)
+
+# Transformation seems close to x ^ (2/3)
+gdp_trans <- gdp_gt0 ^ (2/3)
+
+# Graph
+par(mfrow = c(1, 2))
+hist(gdp_trans)
+boxplot(gdp_trans)
+```
+
+Still a *lot* of outliers, which will likely cause normality violations. However, the data appears to be more symmetrically distributed.
+
+The next step would be to apply transformations to our predictors. However, the goal of this study is to investigate the effects of each of our predictors, especially broadband, internet usage, mobile, and region, on GDP per capita growth. That is, we are building a descriptive, not predictive, linear model. Thus, transforming our predictors too much would increase the complexity and decrease the interpretability of our model. We will thus proceed with only using the transformed response in our model.
+
+```{r}
+model_trans <- lm(gdp_trans ~ broadband * region + mobile + internet_use + gross_capital + trade_gdp + school_enroll + pop_growth + urban_pop + inflation + fdi + rule_of_law, df.train)
+
+summary(model_trans)
+```
+
+And we'll recheck the plots to make sure everything still looks good:
+
+```{r}
+fits2 <- fitted(model_trans)
+r2 <- residuals(model_trans)
+
+# Conditional mean response condition
+plot(fits2, gdp_trans)
+abline(a = 0, b = 1, col = "red")
+
+par(mfrow = c(1, 2))
+qqnorm(r2)
+qqline(r2)
+plot(fits2, r2)
+```
+The shape of the normal Q-Q plot looks the same, but the magnitude of the deviations has been significantly reduced. The same goes for the residuals vs. fitted plots.
+
+Compare normal QQ plots for original and transformed model.
+```{r}
+library(ggpubr)
+p1 <- ggplot() +
+  geom_qq(mapping = aes(sample = r)) +
+  geom_qq_line(aes(sample = r), color = "red") +
+  labs(x = "Theoretical Quantiles", y = "Sample Quantiles") +
+  theme_bw() +
+  theme(panel.grid = element_blank()) +
+  theme(text = element_text(size = 16))
+
+p2 <- ggplot() +
+  geom_qq(mapping = aes(sample = r2)) +
+  geom_qq_line(aes(sample = r2), color = "red") +
+  labs(x = "Theoretical Quantiles", y = "Sample Quantiles") +
+  theme_bw() +
+  theme(panel.grid = element_blank()) +
+  theme(text = element_text(size = 16))
+
+ggarrange(p1, p2, nrow = 1, labels = "AUTO")
+```
+
+```{r}
+vif(model_trans)
+```
+No significant multicollinearity! Good!
+
+# 8. Examine problematic observations
+# 8.1. Pre-transformations
+```{r}
+# Extract standard influence measures
+infl <- influence.measures(model_prelim)
+
+# Hat values (leverage)
+hats <- hatvalues(model_prelim)
+
+# Standardized residuals
+std_res <- rstandard(model_prelim)
+
+# Cook's distance
+cooks <- cooks.distance(model_prelim)
+
+# DFFITS
+dffits <- dffits(model_prelim)
+
+# DFBETAS
+dfbetas <- dfbetas(model_prelim)
+
+n <- nrow(df.train)
+p <- length(coef(model_prelim)) - 1 #excluding intercept
+```
+
+Cutoffs
+```{r}
+lev_cutoff <- 2 * (p+1) / n
+cook_cutoff <- qf(0.5, df1 = p + 1, df2 = n - p - 1)
+# dffits cutoffs
+fitcut <- 2 * sqrt((p + 1) / n)
+# dfbeta cutoffs
+betacut <- 2 / sqrt(n)
+
+```
+
+Evaluating observations
+```{r}
+# leverage flags
+lev_points <- which(hats > lev_cutoff)
+
+# which observations are regression outliers?
+res_points <- which(std_res > 4 | std_res < -4)
+
+# Cook's distance
+cook_points <- which(cooks > cook_cutoff)
+
+# which observations are influential by dffits?
+fit_points <- which(abs(dffits) > fitcut)
+
+# DFBETAs — flagged if *any* coefficient exceeds betacut1
+beta_points <- which(apply(abs(dfbetas) > betacut, 1, any))
+
+```
+
+```{r}
+prob_obs_prelim <- sort(unique(
+  c(lev_points, res_points, cook_points, fit_points, beta_points)
+))
+
+prob_obs_prelim
+
+
+problematic_table_prelim <- tibble(
+  index = prob_obs_prelim,
+  leverage = hats[prob_obs_prelim],
+  std_residual = std_res[prob_obs_prelim],
+  cooks_distance = cooks[prob_obs_prelim],
+  dffits = dffits[prob_obs_prelim],
+  max_dfbetas = apply(abs(dfbetas)[prob_obs_prelim, ], 1, max)
+)
+
+problematic_table_prelim
+
+```
+The analysis reveals substantial number of observations (over 500) exceeded at least one diagnostic cutoff, as shown in the problematic observation index list. Most of these cases arise from data points with moderately high leverage or slightly large influence rather than extreme outliers. Importantly, no single observation showed simultaneously high leverage, large standardized residuals, and a large Cook’s distance, which would have indicated a strongly influential point. Such patterns are usually common in large, heterogeneous macroeconomic datasets.
+
+Diagnostic plots for Problematic Observations
+```{r}
+par(mfrow = c(2, 2))
+
+# 1. Leverage plot
+plot(hats, pch = 19, col = "gray",
+     main = "Leverage (Hat Values)",
+     ylab = "Hat values")
+abline(h = lev_cutoff, col = "red", lwd = 2)
+
+# 2. Standardized residuals plot
+plot(std_res, pch = 19, col = "gray",
+     main = "Standardized Residuals",
+     ylab = "Standardized residual")
+abline(h = 4, col = "red", lwd = 2)
+abline(h = -4, col = "red", lwd = 2)
+
+# 3. Cook's distance plot
+plot(cooks, pch = 19, col = "gray",
+     main = "Cook's Distance",
+     ylab = "Cook's distance")
+abline(h = cook_cutoff, col = "red", lwd = 2)
+
+# 4. DFFITS plot
+plot(dffits, pch = 19, col = "gray",
+     main = "DFFITS",
+     ylab = "DFFITS value")
+abline(h = fitcut, col = "red", lwd = 2)
+abline(h = -fitcut, col = "red", lwd = 2)
+
+```
+Across all diagnostics, a moderate number of observations are flagged, mostly due to mild leverage or influence rather than extreme behaviour. Some points sit farther from the multivariate centre, which is expected in a diverse macroeconomic dataset spanning high- and low-income regions. Standardized residuals stay within ±4, and Cook’s distances are well below the cutoff, indicating no severe outliers or influential observations. Although a few cases exceed DFFITS or DFBETA thresholds, these effects are small and scattered. Overall, the diagnostics reflect normal economic heterogeneity rather than data issues, and no observations require removal.
+
+Removing points would distort real cross-country variation and bias results toward more stable economies. The flagged cases instead reflect meaningful economic heterogeneity—such as growth shocks, high-inflation years, and differing broadband or institutional conditions central to understanding how broadband and regional factors relate to GDP growth. Therefore, all observations are retained without refitting the model.
+
+# 8.2. Post-transformations
+```{r}
+# Extract standard influence measures
+infl_t <- influence.measures(model_trans)
+
+# Hat values (leverage)
+hats_t <- hatvalues(model_trans)
+
+# Standardized residuals
+std_res_t <- rstandard(model_trans)
+
+# Cook's distance
+cooks_t <- cooks.distance(model_trans)
+
+# DFFITS
+dffits_t <- dffits(model_trans)
+
+# DFBETAS
+dfbetas_t <- dfbetas(model_trans)
+
+n2 <- nrow(df.train)
+p2 <- length(coef(model_trans)) - 1 #excluding intercept
+```
+
+Cutoffs
+```{r}
+lev_cutoff_t <- 2 * (p2+1) / n2
+cook_cutoff_t <- qf(0.5, df1 = p2 + 1, df2 = n2 - p2 - 1)
+# dffits cutoffs
+fitcut_t <- 2 * sqrt((p2 + 1) / n2)
+# dfbeta cutoffs
+betacut_t <- 2 / sqrt(n2)
+
+```
+
+Evaluating observations
+```{r}
+# leverage flags
+lev_points_t <- which(hats_t > lev_cutoff_t)
+
+# which observations are regression outliers?
+res_points_t <- which(std_res_t > 4 | std_res_t < -4)
+
+# Cook's distance
+cook_points_t <- which(cooks > cook_cutoff_t)
+
+# which observations are influential by dffits?
+fit_points_t <- which(abs(dffits_t) > fitcut_t)
+
+# DFBETAs — flagged if *any* coefficient exceeds betacut1
+beta_points_t <- which(apply(abs(dfbetas_t) > betacut_t, 1, any))
+
+```
+
+```{r}
+prob_obs_trans <- sort(unique(
+  c(lev_points_t, res_points_t, cook_points_t, fit_points_t, beta_points_t)
+))
+
+prob_obs_trans
+
+
+problematic_table_trans <- tibble(
+  index = prob_obs_trans,
+  leverage = hats[prob_obs_trans],
+  std_residual = std_res[prob_obs_trans],
+  cooks_distance = cooks[prob_obs_trans],
+  dffits = dffits[prob_obs_trans],
+  max_dfbetas = apply(abs(dfbetas_t)[prob_obs_trans, ], 1, max)
+)
+
+problematic_table_trans
+
+```
+
+The transformed model again flags over 500 observations (slightly more than the original model) across the diagnostics, mostly due to moderate leverage or mild influence rather than extreme outliers. No point shows the combination of high leverage, large residuals, and high Cook’s D required to classify it as strongly influential. This pattern reflects normal cross-country macroeconomic variation in inflation, capital formation, broadband access, and governance. Removing such cases would distort meaningful economic heterogeneity, so we retain all observations and do not refit the model.
+
+Diagnostic plots for Problematic Observations
+```{r}
+par(mfrow = c(2, 2))
+
+# 1. Leverage plot
+plot(hats_t, pch = 19, col = "gray",
+     main = "Leverage (Hat Values)",
+     ylab = "Hat values")
+abline(h = lev_cutoff_t, col = "red", lwd = 2)
+
+# 2. Standardized residuals plot
+plot(std_res_t, pch = 19, col = "gray",
+     main = "Standardized Residuals",
+     ylab = "Standardized residual")
+abline(h = 4, col = "red", lwd = 2)
+abline(h = -4, col = "red", lwd = 2)
+
+# 3. Cook's distance plot
+plot(cooks_t, pch = 19, col = "gray",
+     main = "Cook's Distance",
+     ylab = "Cook's distance")
+abline(h = cook_cutoff_t, col = "red", lwd = 2)
+
+# 4. DFFITS plot
+plot(dffits_t, pch = 19, col = "gray",
+     main = "DFFITS",
+     ylab = "DFFITS value")
+abline(h = fitcut_t, col = "red", lwd = 2)
+abline(h = -fitcut_t, col = "red", lwd = 2)
+
+```
+
+The diagnostic plots for the transformed model show the same overall pattern as the original but with slightly improved residual behaviour. Few data points still exceed the leverage cutoff—expected in a heterogeneous macroeconomic dataset yet standardized residuals now fall comfortably within ±4, and Cook’s distances remain well below the threshold, indicating no severe outliers or influential points. Although some observations exceed DFFITS or DFBETA cutoffs, these effects are small and scattered. Compared to the untransformed model, the transformed version shows greater residual stability but leads to the same conclusion: the flagged observations reflect genuine economic heterogeneity, such as rapid growth shifts, inflation volatility, or sharp differences in broadband access, rather than data issues. As none of these points distort the regression surface and they capture meaningful structural variation, all observations are retained without refitting.
+
+# 9. Model selection
+We try the approach of removing all the insignificant variables in the transformed model. We look back at the transformed model.
+
+```{r}
+model_trans <- lm(gdp_trans ~ broadband * region + mobile + internet_use + gross_capital + trade_gdp + school_enroll + pop_growth + urban_pop + inflation + fdi + rule_of_law, df.train)
+
+summary(model_trans)
+```
+We see the variables `broadband`, `regions` and the broadband x region interactions excluding Central Asia, `fdi`, `internet_use`, `trade_gdp` and `rule_of_law` being statistically insignificant with p-values higher than 0.05. So, we will try to remove these variables as well and apply partial f test. But we will not remove `internet_use`, `broadband`, `regions` or the interactions since it is relevant for the research question.
+
+```{r}
+model_reduced <- lm(gdp_trans ~ broadband * region + mobile + internet_use + gross_capital + school_enroll + pop_growth + urban_pop + inflation, df.train)
+
+summary(model_reduced)
+```
+
+```{r}
+anova(model_reduced, model_trans)
+```
+We see the p-value shows *0.2155* which indicates that there is no significant difference between the two model. This means we can eliminate those three variables. To affirm this, let's try an automated approach with backward selection method forcing it to keep the important variables for the research question.
+
+```{r}
+library(MASS)
+
+stepAIC(model_trans, scope=list(lower=gdp_trans ~ broadband*region + internet_use + mobile), direction = "backward", trace = TRUE)
+```
+Perfect! We see that the backward selection also suggest `fdi`, `trade_gdp` and `rule_of_law` to be removed. The agreement between the two method provides strong evidence that those variables do not meaningfully contribute to the model. Now, let's check back the assumptions. 
+
+```{r}
+fits_red <- fitted(model_reduced)
+r_red <- residuals(model_reduced)
+
+# Conditional mean response condition
+plot(fits_red, gdp_trans)
+abline(a = 0, b = 1, col = "red")
+
+par(mfrow = c(1, 2))
+qqnorm(r_red)
+qqline(r_red)
+plot(fits_red, r_red)
+
+vif(model_reduced)
+```
+All looks good apart from the remained problem of Normality.
+
+# 10. Model validation
+First, we're going to fit a model using the same formula for `model_best` using our test data.
+
+```{r}
+# transform response
+gdp_gt0_test <- df.test$gdp_growth + abs(min(df.test$gdp_growth)) + 1
+gdp_trans_test <- gdp_gt0_test ^ (2/3)
+
+# Fit model
+model_best_test <- lm(gdp_trans_test ~ broadband * region + mobile + internet_use + gross_capital + school_enroll + pop_growth + urban_pop + inflation, df.test)
+
+summary(model_best_test)
+```
+
+And we'll check assumptions as well:
+
+```{r}
+fits_test <- fitted(model_best_test)
+r_test <- residuals(model_best_test)
+
+# Conditional mean response condition
+plot(fits_test, gdp_trans_test)
+abline(a = 0, b = 1, col = "red")
+
+par(mfrow = c(1, 2))
+qqnorm(r_test)
+qqline(r_test)
+plot(fits_test, r_test)
+
+vif(model_best_test)
+```
+Doesn't seem like we have any issues not already present in the training data set!
+
+Now, we can compare the two models.
+```{r}
+# ---- Test-Set MSE for Reduced Model ----
+
+# 1. Predict using model trained on training data
+test_preds <- predict(model_reduced, newdata = df.test)
+
+# 2. Compute MSE using the transformed test response
+test_mse <- mean((gdp_trans_test - test_preds)^2)
+test_mse
+
+```
+
+The test-set MSE of **24.32** reflects the model’s average squared prediction error on unseen data. It is larger than the typical residual variation observed in the training set, suggesting that the reduced model does not generalize well and may suffer from some degree of overfitting. We further compare the models in further detail.
+
+
+```{r}
+# 1. Same number of significant coefficients
+coef_model_train <- summary(model_reduced)$coef %>%
+  as.data.frame()
+coef_model_test <- summary(model_best_test)$coef %>%
+  as.data.frame()
+
+significant_train <- coef_model_train %>%
+  filter(`Pr(>|t|)` < 0.05)
+significant_test <- coef_model_test %>%
+  filter(`Pr(>|t|)` < 0.05)
+
+sprintf("The model fit to training data has %d significant coefficeints",
+        nrow(significant_train))
+sprintf("The model fit to testing data has %d significant coefficients",
+        nrow(significant_test))
+
+# Find which coefficients are common to both
+print("Common significant predictors:")
+intersect(rownames(significant_train), rownames(significant_test))
+```
+
+There is a *slight* difference in the number of significant predictors between the models fit to the training vs. testing data. 4 predictors are significant in both models: gross capital, urban population, school enrollment, and inflation.
+
+```{r}
+# Get top 10 most important predictors
+top10 <- coef_model_train %>%
+  rownames_to_column("Name") %>%
+  filter(Name != "(Intercept)") %>%
+  arrange(desc(abs(Estimate))) %>%
+  slice(1:10)
+
+ggplot(top10, aes(x = Name, y = Estimate)) +
+  geom_col(color = "black", fill = "black") +
+  theme_bw() +
+  geom_hline(yintercept = 0, color = "black") +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1)) +
+  theme(plot.margin = unit(c(0.5, 0.5, 0.5, 1.5), "cm"))
+```
+
+
+
+```{r}
+# 2. Coefficients within 2 standard errors (of training data)
+significant_diff_train <- c()
+for (predictor in rownames(coef_model_train)) {
+  # Training data coefficient value and SE
+  train_coef <- coef_model_train[predictor, ]$Estimate
+  train_se <- coef_model_train[predictor, ]$`Std. Error`
+  
+  # Testing data coefficient value
+  test_coef <- coef_model_test[predictor, ]$Estimate
+  
+  if (train_coef - train_se >= test_coef || test_coef >= train_coef + train_se) {
+    significant_diff_train <- c(significant_diff_train, predictor)
+  }
+}
+
+# Coefficients within 2 standard errors (of testing data)
+significant_diff_test <- c()
+for (predictor in rownames(coef_model_train)) {
+  # Training data coefficient value and SE
+  train_coef <- coef_model_train[predictor, ]$Estimate
+
+  # Testing data coefficient value
+  test_coef <- coef_model_test[predictor, ]$Estimate
+  test_se <- coef_model_test[predictor, ]$`Std. Error`
+  
+  if (test_coef - test_se >= train_coef || train_coef >= test_coef + test_se) {
+    significant_diff_test <- c(significant_diff_test, predictor)
+  }
+}
+
+sprintf("Using training data SE's, there are %d significantly different coefficients",
+        length(significant_diff_train))
+sprintf("Using testing data SE's, there are %d significantly different coefficients",
+        length(significant_diff_test))
+
+print("Significantly different in both:")
+intersect(significant_diff_train, significant_diff_test)
+```
+This isn't promising... in the best case, there are 7 coefficients with estimates that are significantly different (more than 2 SE's apart) between the training and testing data. Moreover, 3/4 predictors commonly significant in both models, gross capital, inflation, and urban population, are significantly different between the two models!
+
+```{r}
+summary(model_reduced)$adj.r.squared
+summary(model_best_test)$adj.r.squared
+```
+
+Okay! That's pretty similar. The values are within about 0.02 of one another.
+
+From previous assumption checks, we already know neither model has any VIF greater than 5. Let's examine the differences between them.
+
+```{r}
+vif(model_reduced) - vif(model_best_test)
+```
+
+Okay! Only broadband has a fairly large difference of about 0.38. But nothing major, so differences in multicollinearity check out as well.
+
+However, based on the number of significant coefficients and the values of the coefficients being significantly different, I think it's fair to say the model is *not exactly* validated. Since we know the variances of both datasets are similar in terms of the response variable AND we don't see differences in multicollinearity, the next important thing to check is differences in problematic observations.
+
+Problematic Observation Evaluation- Final Selected Model
+```{r}
+# Influence measures for the final selected model
+infl_best <- influence.measures(model_reduced)
+
+# Extract components
+hats_b <- hatvalues(model_reduced)
+stdres_b <- rstandard(model_reduced)
+cooks_b <- cooks.distance(model_reduced)
+dffits_b <- dffits(model_reduced)
+dfbetas_b <- dfbetas(model_reduced)
+
+# Sample size + number of predictors
+n_b <- nrow(df.train)
+p_b <- length(coef(model_reduced)) - 1
+
+```
+
+Cutoffs
+```{r}
+# Leverage cutoff
+lev_cut_b <- 2 * (p_b + 1) / n_b
+
+# Cook's cutoff (F-distribution)
+cook_cut_b <- qf(0.5, df1 = p_b + 1, df2 = n_b - p_b - 1)
+
+# DFFITS cutoff
+fit_cut_b <- 2 * sqrt((p_b + 1) / n_b)
+
+# DFBETAS cutoff
+beta_cut_b <- 2 / sqrt(n_b)
+
+```
+
+Identification of problematic observation
+```{r}
+# Flagging problematic observations
+lev_points_b  <- which(hats_b > lev_cut_b)
+res_points_b  <- which(abs(stdres_b) > 4)
+cook_points_b <- which(cooks_b > cook_cut_b)
+fit_points_b  <- which(abs(dffits_b) > fit_cut_b)
+beta_points_b <- which(apply(abs(dfbetas_b) > beta_cut_b, 1, any))
+
+# Combine
+prob_obs_best <- sort(unique(
+  c(lev_points_b, res_points_b, cook_points_b, fit_points_b, beta_points_b)
+))
+
+prob_obs_best
+
+```
+
+```{r}
+library(tibble)
+
+problematic_table_best <- tibble(
+  index = prob_obs_best,
+  leverage = hats_b[prob_obs_best],
+  std_residual = stdres_b[prob_obs_best],
+  cooks_distance = cooks_b[prob_obs_best],
+  dffits = dffits_b[prob_obs_best],
+  max_dfbetas = apply(abs(dfbetas_b)[prob_obs_best, ], 1, max)
+)
+
+problematic_table_best
+
+```
+
+Using all five diagnostic measures, the pocedure flags over 500 observations as potentially influential.This is a very large proportion of the dataset, indicating that the flagged points are not isolated outliers but rather widespread small deviations that cross conservative cutoffs.The high count is therefore a consequence of the structural heterogeneity in the global economic dataset, where countries vary substantially in ICT access, growth patterns, and regional characteristics. This pattern is consistent with the results obtained from the transformed model and reinforces that the flags arise from dataset scale and variability, not from any single country dominating the fit. 
+
+```{r}
+par(mfrow = c(2, 2))
+
+plot(hats_b, pch=19, col="gray",
+     main="Leverage (Selected Model)", ylab="Hat values")
+abline(h = lev_cut_b, col="red", lwd=2)
+
+plot(stdres_b, pch=19, col="gray",
+     main="Standardized Residuals (Selected Model)")
+abline(h = 4, col="red", lwd=2)
+abline(h = -4, col="red", lwd=2)
+
+plot(cooks_b, pch=19, col="gray",
+     main="Cook's Distance (Selected Model)")
+abline(h = cook_cut_b, col="red", lwd=2)
+
+plot(dffits_b, pch=19, col="gray",
+     main="DFFITS (Selected Model)")
+abline(h = fit_cut_b, col="red", lwd=2)
+abline(h = -fit_cut_b, col="red", lwd=2)
+
+```
+The leverage plot shows that several countries sit above the leverage cutoff, indicating more extreme predictor combinations, but none approach levels that raise practical concern and thus they do not meaningfully pull the fitted regression line. Standardized residuals remain well within the ±4 threshold, and Cook’s distances are extremely small across all observations, showing that even higher-leverage points do not materially affect the model’s predictions or coefficient estimates. Although the diagnostic rules flag many observations numerically, the magnitude of each measure indicates that the model is stable, and the flagged cases reflect the natural variability of large cross-country economic data rather than genuine influence. As a result, there is no justification for removing any observations, and the final reduced model remains reliable for interpretation and validation.
+
+Comparison of Problematic Observations: Transformed vs Final Selected Model
+
+Observations unique to either models
+```{r}
+only_in_trans <- setdiff(prob_obs_trans, prob_obs_best)
+only_in_best  <- setdiff(prob_obs_best, prob_obs_trans)
+
+only_in_trans
+only_in_best
+
+```
+The transformed model and the final selected model flag a small number unique to each list. The few cases flagged only in the transformed model are countries with extreme zeros or missing ICT indicators, which become more noticeable after scaling the response. Conversely, the cases flagged only in the final model arise from mild coefficient-sensitivity (DFBETAs/DFFITS) after removing predictors, not from high leverage or large residuals. The differences reflect small shifts in model specification and transformation rather than influential outliers.
+
+
+Common Observations 
+```{r}
+common_prob_obs <- intersect(prob_obs_trans, prob_obs_best)
+common_prob_obs
+
+length(prob_obs_trans)
+length(prob_obs_best)
+length(common_prob_obs)
+
+```
+
+The two models share an exceptionally large number of problematic observations (534 in common), indicating that the diagnostic flags are driven by broad underlying data patterns rather than by the transformation or the reduced specification. These recurring cases likely reflect countries with volatile GDP growth, sparse or uneven ICT indicators, or region–broadband combinations that create mild coefficient sensitivity. Importantly, because leverage, standardized residuals, and Cook’s distances remain small for these observations, they do not materially influence the broadband–GDP relationship.
+
+```{r}
+
+prob_obs_compare <- tibble(
+  in_trans = length(prob_obs_trans),
+  in_best = length(prob_obs_best),
+  common = length(common_prob_obs),
+  only_trans = length(only_in_trans),
+  only_best = length(only_in_best)
+)
+
+prob_obs_compare
+
+```
+
+The comparison shows that both models flag a very similar number of problematic observations (578 in the transformed model and 587 in the reduced model), with 534 observations appearing in both lists. Although each model has a modest number of unique flags (44 only in the transformed model and 53 only in the reduced model), the substantial overlap indicates that the diagnostics are largely driven by broad data heterogeneity.
+
