@@ -5,21 +5,6 @@ Empirical analysis of broadband penetration and GDP per capita growth across cou
 
 ---
 
-## Table of Contents
-
-* [Project Overview](#project-overview)
-* [Research Question](#research-question)
-* [Data Sources](#data-sources)
-* [Data Preparation](#data-preparation)
-* [Modeling Framework](#modeling-framework)
-* [Model Diagnostics and Validation](#model-diagnostics-and-validation)
-* [Results](#results)
-* [Limitations](#limitations)
-* [Repository Structure](#repository-structure)
-* [How to Reproduce](#how-to-reproduce)
-* [Citations](#citations)
----
-
 ## Project Overview
 
 This project empirically investigates the relationship between broadband penetration and cross-country GDP per capita growth during the global broadband expansion period from 1995 to 2015. Using a panel dataset of 217 countries drawn from the World Bank’s *World Development Indicators*, the analysis applies linear regression techniques combined with systematic data preprocessing, model selection, and validation procedures.
