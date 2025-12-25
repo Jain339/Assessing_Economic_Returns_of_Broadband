@@ -1,8 +1,6 @@
 # Assessing the Economic Returns of Broadband: Cross-Country Evidence from the Broadband Boom Era (1995–2015)
 Empirical analysis of broadband penetration and GDP per capita growth across countries (1995–2015), using World Bank data and regression-based model selection and validation techniques.
 
-**Authors:** Jake Cohen, Nikita Jain and Theo Ambarita
-
 ---
 
 ## Project Overview
